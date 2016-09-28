@@ -1,0 +1,5 @@
+0.1	
+	initial version
+0.2	
+	add several new options in runcronjobs.conf
+	add a --man option in the command line

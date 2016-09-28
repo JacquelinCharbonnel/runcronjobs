@@ -1,0 +1,10 @@
+SHELL=/bin/bash
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+MAILTO=root
+HOME=/
+
+# runcronjobs
+01 * * * * root runcronjobs /etc/runcronjobs.d/hourly
+02 4 * * * root runcronjobs /etc/runcronjobs.d/daily
+22 4 * * 0 root runcronjobs /etc/runcronjobs.d/weekly
+42 4 1 * * root runcronjobs /etc/runcronjobs.d/monthly

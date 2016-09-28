@@ -1,0 +1,276 @@
+NAME
+    runcronjobs - centralized cron jobs processor
+
+SYNOPSIS
+    runcronjobs options directory
+
+DESCRIPTION
+    "runcronjobs" processes the execution of centralized cron jobs for a
+    pool of servers.
+
+    The cron jobs are any executable files (scripts and binaries).
+    "runcronjobs" runs cronjobs located in a given directory if the current
+    host is specified as a target host for this jobs (see directives
+    bellow). This allows to centralize all the cron jobs of a set of servers
+    in a common shared directory.
+
+FEATURES
+    - notification by mail on each invocation
+        The mail report begins with a global summary for all the jobs :
+        timestamp of the begin of execution, timestamp of the end, elapsed
+        time, return code, following by the output of each of them (and
+        optionnal additionnal informations).
+
+    - capabilities of parallelization for jobs executions
+    - optionnal delay before execution
+
+COMMAND LINE ARGUMENTS
+    The command line arguments are :
+
+     -v --verbose : verbose level
+     -d --debug : debug level
+     -n --dry-run : dry run, don't execute jobs
+     -f --foreground : jobs are no threaded
+     --no-sleep : sleep directives are ignored
+     --no-mail : don't send mail
+     -h *hostname* : simule execution from this host
+     -c *config_file* : use an alternate configuration file (default is
+    "runcronjobs.conf" located in the executable directory or, if not found,
+    in /etc)
+
+JOB DIRECTIVES
+    Somme directives can be insered anywhere into the jobs. They allow to
+    control the behaviour of "runcronjobs".
+
+    A directive is a line containing the string _runcronjobs_. The begin of
+    the line (before _runcronjobs_) is ignored, and the rest (after
+    _runcronjobs_) is parsed. So, the directive can be located for example
+    in a comment or a string constant, depending of the language using by
+    the job. A # in a directive begins a comment.
+
+    For exemple,
+
+            # _runcronjobs_ server1 server2(detach=1) @group1 # my comment
+
+    can be a directive line in a shell or perl job.
+
+    The syntax of the directive is one or more specifications following the
+    _runcronjobs_ tag, each specification delimited by white spaces :
+
+            _runcronjobs_ spec1 spec2 spec3...
+
+  Specifications
+    Specifications are :
+
+    hostname :
+            adds a target host for this jobs.
+
+    hostname(arg1=val1,arg2=val2,...) :
+            adds a target host for this jobs, and specifies some valued
+            arguments for this host
+
+    @group :
+            adds a group of target hosts for this jobs. This group must be
+            defined in the configuration file
+
+    @group(arg1=val1,arg2=val2,...) :
+            adds a group of target hosts for this jobs, and specifies some
+            valued arguments for every host member of this group
+
+    (arg1=val1,arg2=val2,...) :
+            specifies valued arguments for any target hosts
+
+  Valued arguments
+    Possible valued arguments are :
+
+    detach=0/1 (default is 0)
+        activate/desactivate an independant thread for this job
+
+    sleep=n
+        run jobs after a sleep period on n minutes (useful for threaded
+        jobs)
+
+    output=0/1 (default is 1)
+        activate/desactivate the output reporting
+
+    verbose=0/1 (default is 0)
+        activate additionnal messages in the output reporting
+
+  Examples
+    Below are examples of shell scripts as cron jobs :
+
+            #!/bin/sh
+        
+            # _runcronjobs_ server1 server2 
+        
+            /usr/bin/find /tmp -mtime +10 -exec rm {} \;
+            exit $?
+
+    The previous job will be run by hosts server1 and server2
+
+            #!/bin/sh
+        
+            # _runcronjobs_ server1 server2(detach=1,sleep=10) 
+            # _runcronjobs_ (output=1)      # global options
+        
+            /usr/bin/find /tmp -mtime +10 -exec rm {} \;
+            exit $?
+
+    The previous job will be run by hosts server1 and server2. Two arguments
+    are set for server2, so this job will be detach from the sequential
+    stream, and a pause of 10mn will be assumed before execution beginning.
+
+            #!/bin/sh
+        
+            # _runcronjobs_ @group
+        
+            /usr/bin/find /tmp -mtime +10 -exec rm {} \;
+            exit $?
+
+    The previous job will be run by every hosts members of the group group.
+    groups1 must be defined in the configuration file.
+
+            #!/bin/sh
+        
+            # _runcronjobs_ server @group
+            # _runcronjobs_ (output=1)      # global options
+        
+            /usr/bin/find /tmp -mtime +10 -exec rm {} \;
+            exit $?
+
+    The previous job will be run by every hosts members of the group group,
+    and by server. Argument output is set for every hosts.
+
+            #!/bin/sh
+        
+            # _runcronjobs_ server1 server2(detach=1,sleep=10) 
+            # _runcronjobs_ server3 @group1
+            # _runcronjobs_ (output=1)      # global options
+        
+            /usr/bin/find /tmp -mtime +10 -exec rm {} \;
+            exit $?
+
+CONFIGURATION FILE
+    The default configuration file is "runcronjob.conf", located in the same
+    directory as the binary, or in "/etc" and "/etc/runcronjobs.d"
+    otherwise. It can be redefined with the -c option.
+
+  Variables definition
+    Some variable can be defined with the syntax :
+
+            variable=value
+
+    See "runcronjobs.conf-sample" file for more explanations.
+
+  Host groups definition
+    Host groups are defined in a section "<host_groups></host_groups>" in
+    which each group is defined with a line like :
+
+            group=member1,member2,member3
+
+    A group can be a member of a group, and in this case, must be prepended
+    with @ :
+
+            group1=member1,@group2
+
+  Example
+            <host_groups>
+                    all=@interactives,@monitoring,@mail
+                    mail=mx1,mx2
+                    monitoring=nagios,perfs
+                    interactives=users1,users2,users3
+            </host_groups>
+
+OUTPUT
+    "runcronjobs" send a mail on each run. This mail begins with a summary
+    of the launched jobs, one line per job, sorted by beginning timestamp.
+    The f""ormat of this line is :
+
+            begin_timestamp
+             -
+              end_timestamp 
+               jobname 
+                rank_of_end_timestamp flags 
+                 - 
+                  return 
+                   retcode
+
+    Flags are :
+
+    & : job execution has been detached ("detach" directive)
+    z : job has slept ("sleep" directive)
+
+    The f""ormat of the subject of the mail is :
+
+            directory name
+             # of jobs run
+              hostname
+               ***
+
+    where the number of stars is the number of jobs which has returned a non
+    zero return code.
+
+HOW TO USE RUNCRONJOBS
+    To centralize the control of the cron jobs for several servers, create a
+    shared directory ("/shared/cron.d", for example), and subdirs like
+    hourly, daily, weekly, monthly, and put your cron jobs on them. Add one
+    or more directives in each cron job to specify at least the host targets
+    (optionnally with arguments), like :
+
+            # _runcronjobs_ server1 server2(detach=1) server3
+
+    Then add in the crontab of each server something like :
+
+            52 * * * * root /shared/runcronjobs /shared/cron.d/hourly
+            31 3 * * * root /shared/runcronjobs /shared/cron.d/daily
+            21 2 * * 1 root /shared/runcronjobs /shared/cron.d/weekly
+            11 1 1 * * root /shared/runcronjobs /shared/cron.d/monthly
+
+    After that, each server will run its own jobs. =pod
+
+SEE ALSO
+    "MIME::Entity", "Config::General", "Dir::Which", "Set::Groups"
+
+AUTHOR
+    Jacquelin Charbonnel, "<http://math.univ-angers.fr/~charbonnel>"
+
+BUGS
+    Please report any bugs or feature requests to "<jacquelin.charbonnel at
+    math.cnrs.fr>"
+
+SUPPORT
+    Last version can be found on "<http://math.univ-angers.fr/runcronjobs>"
+
+    You can find documentation for this module with the perldoc command :
+
+        perldoc runcronjobs
+
+COPYRIGHT & LICENSE
+    Copyright Jacquelin Charbonnel < jacquelin.charbonnel at math.cnrs.fr >
+
+    This software is governed by the CeCILL-C license under French law and
+    abiding by the rules of distribution of free software. You can use,
+    modify and/ or redistribute the software under the terms of the CeCILL-C
+    license as circulated by CEA, CNRS and INRIA at the following URL
+    "http://www.cecill.info".
+
+    As a counterpart to the access to the source code and rights to copy,
+    modify and redistribute granted by the license, users are provided only
+    with a limited warranty and the software's author, the holder of the
+    economic rights, and the successive licensors have only limited
+    liability.
+
+    In this respect, the user's attention is drawn to the risks associated
+    with loading, using, modifying and/or developing or reproducing the
+    software by the user in light of its specific status of free software,
+    that may mean that it is complicated to manipulate, and that also
+    therefore means that it is reserved for developers and experienced
+    professionals having in-depth computer knowledge. Users are therefore
+    encouraged to load and test the software's suitability as regards their
+    requirements in conditions enabling the security of their systems and/or
+    data to be ensured and, more generally, to use and operate it in the
+    same conditions as regards security.
+
+    The fact that you are presently reading this means that you have had
+    knowledge of the CeCILL-C license and that you accept its terms.
+

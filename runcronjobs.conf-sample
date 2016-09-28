@@ -1,0 +1,36 @@
+#
+# runcronjobs configuration file
+#
+
+# destination from mail
+mail_to=root@localhost
+
+# regexp for cronjob file names
+job_name = \.cron$
+
+# SMTP server 
+smtp_server=localhost
+
+# format of mail
+multiparted_mail=1
+
+# enhanced_mode
+#   1 is the standard
+#	0 is for compatibility with RedHat 'run-parts' script
+#   if set to 0, body of cronjobs aren't scanned
+#   so each cronjob is run inconditionaly
+enhanced_mode=1
+
+# Format for command line
+#   %s is filled with the job name 
+shell_fmt=/bin/bash -c "%s 2>&1"
+
+# The end of this configuration is useless unless enhanced_mode is set to 1
+
+# Host groups definition
+<host_groups>
+	all=@host,@virtual,@external
+	host=linux1,linux2,linux3
+	virtual=vm1,vm2,vm3
+	external=gateway1,gateway2
+</host_groups>

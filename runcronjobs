@@ -1,0 +1,1150 @@
+#!/usr/bin/perl 
+
+#  ======================
+#
+#          Jacquelin Charbonnel - CNRS/LAREMA
+#          jacquelin.charbonnel@math.cnrs.fr 
+#          http://math.univ-angers.fr/runcronjobs
+# 
+#  $Id: runcronjobs 15 2007-10-29 09:32:06Z jaclin $
+#  
+#  ----
+# 
+#    execute .cron scripts in a directory
+#
+#  ----
+#  $LastChangedDate: 2007-10-29 10:32:06 +0100 (Mon, 29 Oct 2007) $ 
+#  $LastChangedRevision: 15 $
+#  $LastChangedBy: jaclin $
+#  $URL: https://svn.math/system-tools/trunk/runcronjobs/runcronjobs $
+# 
+#  ======================
+
+
+use warnings ;
+use Carp ;
+use Getopt::Long ;
+use File::Basename ;
+use Data::Dumper ;
+use Sys::Syslog ;
+use threads ;
+use FindBin ;
+use Net::SMTP ;
+use POSIX qw(strftime);
+use Sys::Hostname;
+use MIME::Entity;
+use Config::General ;
+use Config::General::Extended ;
+use Dir::Which q/which/;
+use Set::Groups ;
+
+use strict ;
+
+my $VERSION = "1.0" ;
+my $REV = '$LastChangedRevision: 12 $' ; $REV =~ s/[^\d\.]//g ; # version management for subversion
+my $VERSION = "1.0.0" ; # version management for git
+
+my $this_prog = basename($0) ;
+my($DATE,$HOSTNAME,$SENDMAIL,$EMAIL) ;
+
+my $TKW="_runcronjobs_" ;		# Target Keyword
+my $CONFFILE = "$this_prog.conf" ;
+my $CONFPATH = "/etc:/etc/${this_prog}.d" ;
+my $FACILITY = "cron" ;
+my $log ;
+
+my $default_conf = {
+	"mail_to" => 'root@localhost'
+	, "job_name" => '\.cron$'
+	, "smtp_server" => "localhost"
+	, "multiparted_mail" => 1
+	, "enhanced_mode" => 1
+	, "shell_fmt" => '/bin/bash -c "%s 2>&1"' 
+} ;
+
+#--------------------
+
+sub help
+{
+  printf(<<"EOL") ;
+$this_prog $VERSION (rev $REV)
+
+Usage: $this_prog options directory
+       $this_prog [--help|--man]
+	   
+Run cron jobs located in a directory
+
+Options are :
+	-c              : use an alternate configuration file 
+	-d --debug      : debug level
+	-f --foreground : don't multi-thread tasks 
+	-h hostname     : simule execution from this host
+	-n --dry-run    : don't execute jobs
+	-v --verbose    : verbose level
+	--no-sleep      : don't perform sleep directives 
+	--no-mail       : don't sent mails
+
+Default $CONFFILE file is searched in $FindBin::Bin:$CONFPATH
+EOL
+  exit(1) ;
+}
+
+sub man
+{
+	print `perldoc $0` ;
+	exit 0 ;
+}
+
+############################################################
+
+{
+	package Config ;
+	require Exporter ;
+	our @ISA = qw(Exporter);
+	our @EXPORT=qw() ;
+
+	use Carp ;
+	use Data::Dumper ;
+	use Dir::Which q/which/ ;
+	
+	#--------------------
+	sub new
+	{
+		my($type,%h) = @_ ;
+		my($this) ;
+		
+		%h = map { /^-/ ? lc(substr($_,1)) : $_ ; } %h ;
+
+		$this->{"args"} = \%h ;
+
+		bless $this,$type ;
+		return $this ;
+	}
+
+	#--------------------
+	sub get_arg
+	{
+	  my($this,$arg) = @_ ;
+	  carp "arg '$arg' undefined" unless exists($this->{"args"}{$arg}) ;
+	  return $this->{"args"}{$arg} ;
+	}
+	#--------------------
+	sub load
+	{
+	  my($this) = @_ ;
+	  my $file = $this->get_arg("file") ;
+	  my $path = $this->get_arg("path") ;
+	  
+	  my $confname ;
+
+          if ($path=~/\S/)
+          {
+            $confname = which(-entry=>$file
+                        ,-defaultpath=>$path
+                        ) ;
+            die "$file not found in $path\n" unless defined $confname ;
+          }
+          else
+          {
+            die "$file not found\n" unless -e $file ;
+            $confname = $file ;
+          }
+
+	  my $conffile=new Config::General(-ConfigFile=>$confname,-ExtendedAccess => 1) or die "can't read $confname" ;
+	  my %conf = %$default_conf ;
+	  {
+		  my %this_conf = $conffile->getall() ;
+		  for my $k (keys %this_conf)
+		  {
+		    $conf{$k} = $this_conf{$k} ;
+		  }
+	  }
+	  # die Dumper \%conf ;
+	  my $groups = new Set::Groups() ;  
+	  #$groups->setDebug(2) ;
+	  
+	  for my $group (keys %{$conf{"host_groups"}})
+	  {
+		my $members = $conf{"host_groups"}{$group} ;
+		for my $member (split(/\s*,\s*/,$members))
+		{
+		  if ($member=~/^@/)
+		  {
+		    $member =~ s/^@// ;
+		    $groups->addOwnGroupTo($member,$group) ;
+		  }
+		  else
+		  {
+		    $groups->addOwnSingleTo($member,$group) ;
+		  }
+		}
+	  }
+	  $this->{"conf"} = \%conf ;
+	  $this->{"groups"} = $groups ;
+	  #return (\%conf,$groups) ;
+	}  
+}
+
+############################################################
+
+############################################################
+
+{
+	package Jobdef ;
+	require Exporter ;
+	our @ISA = qw(Exporter);
+	our @EXPORT=qw() ;
+
+	use Carp ;
+	use Data::Dumper ;
+	
+	sub new
+	{
+		my($type,$rh) = @_ ;
+		my($this) = {
+			"conf" => {}
+			, "hosts" => {}
+			, "groups" => {} 
+			} ;
+
+		bless $this,$type ;
+		return $this ;
+	}
+
+	sub add
+	{
+		my($this,$key1,$key2,$item) = @_ ;
+
+		croak("unknown key '$key1'") unless exists $this->{$key1} ;
+		#print Dumper $key1,$key2,$item ;
+		#die unless $key2 ;
+		$this->{$key1}{$key2} = {} unless exists $this->{$key1}{$key2}  ;
+		for my $k (keys %$item)
+		{
+		  $this->{$key1}{$key2}{$k} = $item->{$k} ;
+		}
+	}
+	
+	sub has
+	{
+		my ($this,$key,$host) = @_ ;
+		die "unknown key '$key'" unless exists($this->{$key}) ;
+		return exists($this->{$key}{$host}) ;
+	}
+
+	sub get
+	{
+		my($this,$key) = @_ ;
+		return keys %{$this->{$key}} ;
+	}
+	
+	sub get_attrs
+	{
+		my ($this,$key1,$key2) = @_ ;
+		return $this->{$key1}{$key2} ;
+	}
+
+	sub _compile_opt
+	{
+	  my($this,$line) = @_ ;
+	  my $result = {} ;
+
+	  $line =~ s/^\(// ;
+	  $line =~ s/\)$// ;
+	  my @opt = split(/\s*,\s*/,$line) ;
+	  for my $o (@opt)
+	  {
+	    my($var,$val) ;
+	    if ($o=~/\=/)
+		{
+		  ($var,$val) = $o=~/^\s*(\w+)\s*=\s*(.*)\s*$/ ;
+		}
+		else 
+		{
+		  $var = $o=~/^\s*(\w+)\s*$/ ;
+		}
+		$result->{lc($var)} = $val ;
+ 	  }
+	  return $result ;
+	}
+
+	sub compile
+	{
+	  my ($this,$line) = @_ ;
+	  
+	  $line =~ s/^.*$TKW\s*\s*// ;
+	  $line =~ s/#.*$// ;
+	  my @items = split(/[\s]+/,$line) ;
+	  
+	  for my $item (@items)
+	  {
+	    if ($item=~/^\(.*?\)$/)
+		{
+		  # global options
+		  my $result = $this->_compile_opt($item) ;
+		  $this->add("conf","global",$result) ;
+		}
+		elsif ($item=~/^@/)
+		{
+		  # group 
+		  my($group,$opt) = $item=~/^@(\w+)(.*)$/ ;
+		  my $result = $this->_compile_opt($opt) if $opt ;
+		  $this->add("groups", $group, $result) ;
+		}
+		elsif ($item=~/^!/)
+		{
+		  # command
+		  last if $item=~/^!end$/i ;
+		}
+		else
+		{
+		  # host
+		  my($host,$opt) = $item=~/^([^\(]+)(.*)$/ ;
+		  my $result = {} ;
+		  $result = $this->_compile_opt($opt) if $opt ;
+		  #die Dumper $result if $opt;
+		  #print	  "res=", Dumper  $result  if $opt ;
+		  $this->add("hosts",$host,$result ) ;
+		}
+	  }
+	}
+	
+}
+
+############################################################
+
+{
+	package Tasks ;
+	require Exporter ;
+	our @ISA = qw(Exporter);
+	our @EXPORT=qw() ;
+
+	use Carp ;
+	use Data::Dumper ;
+	use IO::Dir ;
+	use Sys::Syslog ;
+	use POSIX qw(strftime);
+
+	#--------------------
+	sub new
+	{
+		my($type,%h) = @_ ;
+		my($this) ;
+		
+		%h = map { /^-/ ? lc(substr($_,1)) : $_ ; } %h ;
+
+		$this->{"args"} = \%h ;
+		$this->{"log"} = [] ;
+
+		bless $this,$type ;
+		return $this ;
+	}
+
+	sub get_log { my($this) = @_ ; return $this->{"log"} ; }
+	
+	#--------------------
+	sub init
+	{
+		my($this,%h) = @_ ;
+		my($ok,$found,$task) ;
+		
+		%h = map { /^-/ ? lc(substr($_,1)) : $_ ; } %h ;
+		
+		my $me = $h{"this_host"} ;
+		my $groups = $h{"groups"} ;
+		my $dir = $h{"dir"} ;
+		my $ext = $h{"job_name"} ;
+		
+		my $d = new IO::Dir($dir) or die "Error: can't found directory $dir\n" ;
+		my @entries = $d->read() ;
+		
+		for my $f (sort @entries)
+		{
+		  my $fc = "$dir/$f" ;
+		  next if (-d $fc) ;
+
+		  unless ($fc=~/($ext)$/)
+		  {
+		    $log->debug(3,"$f name doesn't match $ext regexp, ignored\n") ;
+		    next ;
+		  }
+		  unless (-x $fc)
+		  {
+		    $log->debug(3,"$f doesn't have x attribute, ignored\n") ;
+		    next ;
+		  }
+
+			if ($h{"enhanced_mode"}==1)
+			{
+				  open(F,$fc) or die "can't open $fc\n" ;	# search for host target
+				  $ok=$found=0 ;
+				  my $def = new Jobdef ;
+				  while(<F>)
+				  {
+				    chomp ;
+				    if (/$TKW\s*:/i)
+					{
+				      $found=1 ;
+					  # $ok = match($_,$me,$groups) ;
+					  # last if $ok ;
+					  $def->compile($_) ;
+					}
+				  }
+				  close F ;
+				 
+				  unless ($found)
+				  {
+				    warn "NOTICE: '$TKW' not found in '$fc'\n" ;
+				  }
+
+				  my $ok4me = 0 ;
+				  my $ok4mygroup = 0 ;
+				  my $vars ;
+				  
+				  if ($def->has("hosts",$me))
+				  {
+				    $ok = $ok4me = 1 ;
+					$vars = $def->get_attrs("hosts",$me) ;
+				  }
+				  else
+				  {  
+					  for my $g ($def->get("groups"))
+					  {
+						  if ($groups->hasGroup($g))
+						  {
+						    if ($groups->isSingleOf($me,$g))
+							{
+								$ok = $ok4mygroup = $g ;
+								$vars = $def->get_attrs("groups",$g) ;
+								last ;
+							}
+						  }
+						  else
+						  {
+						    warn "unknown group $g\n" ;
+						  }
+					  }
+				  }
+				  
+				  if ($ok) 
+				  {
+				    $log->debug(2,"$f is a job for $me\n") ;
+				  }
+				  else
+				  {
+				    $log->debug(3,"$f is not a job for $me\n") ;
+				    next ;
+				  }
+
+				  $this->{"task"}{$fc} = $def->get_attrs("conf","global") ;
+				  for my $k (keys %$vars)  { $this->{"task"}{$fc}{$k} = $vars->{$k} ; }
+				  #warn Dumper $fc, $def, $this ;
+				  
+				  #$task->{$fc} = $def ;
+				}
+				else #	$h{"enhanced_mode"}!=1
+				{
+					$this->{"task"}{$fc} = undef ;
+				}
+				#warn Dumper $this ;
+		 }
+	}
+
+	sub run
+	{
+		my($this,%h) = @_ ;
+		my (@threads) ;
+		my @log ;
+		my $task = $this->{"args"} ;
+
+		%h = map { /^-/ ? lc(substr($_,1)) : $_ ; } %h ;
+		
+		my $foreground = exists($h{"foreground"}) && $h{"foreground"}==1 ;
+		
+		if (!$foreground)
+		{
+			# run tasks in background
+			for my $t (keys %{$this->{"task"}})
+			{
+			  next unless exists($this->{"task"}{$t}{"detach"}) ;
+			  my $thread = new threads(\&Tasks::exec_th,$this,$t,%h) ;
+			  push(@threads,$thread) ;
+			}
+		}
+
+		# run tasks in foreground
+		for my $t (keys %{$this->{"task"}})
+		{
+		  next if exists($this->{"task"}{$t}{"detach"}) && !$foreground ;
+		  my $l = $this->exec_th($t,%h) ;
+		  push(@log,$l) ;
+		}
+
+		if (!$foreground)
+		{
+			for my $th (@threads)
+			{
+			  my $l2 = $th->join() ;
+			  push(@log,$l2) ;
+			}
+		}
+		push(@{$this->{"log"}},@log) ;
+	}
+	#--------------------
+
+	sub exec_th
+	{
+		my($this,$job,%h) = @_ ;
+	  
+		my $foreground = exists($h{"foreground"}) && $h{"foreground"}==1 ;
+		my $verbose_job = exists($this->{"task"}{$job}{"verbose"}) && $this->{"task"}{$job}{"verbose"}!=0 ; 
+		my $detach_job = exists($this->{"task"}{$job}{"detach"}) && $this->{"task"}{$job}{"detach"}!=0 ; 
+		my $out ;
+		$out = "[info] job detached at ".strftime("%T",localtime(time()))."\n" if $detach_job ;
+
+		  my $sleep = $this->{"task"}{$job}{"sleep"} ; 
+		  if (defined($sleep) && $sleep>0)
+		  {
+			$log->debug(1,sprintf("$job sleeps for $sleep mn\n")) ;
+			unless ($h{"no_sleep"}==1)
+			{
+				$out .= "[info] job is sleeping for $sleep mn\n" if $verbose_job ;
+				sleep($sleep*60) ;
+			}
+		  }
+	   
+		$out .= "[info] begin of job output >>>>>>>>>> :\n" if $verbose_job ;
+		my $runtime = time() ;
+		my $cmd = sprintf($h{"shell_fmt"},$job) ;
+		$log->debug(1,"exec: $cmd\n") ;
+		syslog('info', '%s', $cmd);
+		$out .= `$cmd` ;
+		$out .= "[info] end of job output <<<<<<<<<< !\n" if $verbose_job ;
+	    my $r = $?>>8 ;
+		$log->info(2,"output: ${out}return: $r\n") ;
+
+		$out .= "[info] job returns $r\n" if $verbose_job ;
+		my $end_time = time() ;
+		$out .= sprintf("[info] elapsed time : %fmn\n",($end_time-$runtime)/60.0) if $verbose_job ;
+
+		my $flags = sprintf("%s%s",$detach_job?"&":" ",defined($sleep) && $sleep>0?"z":" ") ;
+	   return { "retcode" => $r
+			, "job" => $job
+			, "begin_time" => $runtime
+			, "end_time" => $end_time
+			, "flags" => $flags
+			, "output" => $out
+			} ;
+	}
+}
+############################################################
+
+############################################################
+
+{
+	package Log ;
+	require Exporter ;
+	our @ISA = qw(Exporter);
+	our @EXPORT=qw() ;
+
+	use Carp ;
+	use Data::Dumper ;
+	use POSIX qw(strftime);
+	use File::Basename ;
+	
+	#--------------------
+	sub new
+	{
+		my($type,%h) = @_ ;
+		my($this) ;
+		
+		%h = map { /^-/ ? lc(substr($_,1)) : $_ ; } %h ;
+
+		$this = \%h ;
+
+		bless $this,$type ;
+		return $this ;
+	}
+
+	#--------------------
+	sub debug
+	{
+	  my ($this,$priority,@msg)=@_ ;
+	  print("debug: ",join("",@msg)) if $priority<=$this->{"debug_level"} ;
+	}
+
+	#--------------------
+	sub info
+	{
+	  my ($this,$priority,@msg)=@_ ;
+	  print(join("",@msg)) if $priority<=$this->{"verbose_level"} ;
+	}
+
+	#--------------------
+	sub summary
+	{
+		my($this,$llog) = @_ ;
+
+		#die Dumper $llog ;
+		my $core_part = strftime("start: %F %T\n\n",localtime($this->{"start_time"})) ;
+		my @attachments ;
+		$this->{"nberr"} = 0 ;
+		
+		my $cpt = 0 ;
+		for my $l (sort { $a->{"end_time"} <=> $b->{"end_time"}} @{$llog})
+		{
+		  $l->{"end_rank"} = ++$cpt ;
+		}
+		
+		for my $l (sort { $a->{"begin_time"} <=> $b->{"begin_time"}} @{$llog})
+		{ 
+		  #print "this=",Dumper $this ; 
+		  $this->{"nberr"}++ if $l->{"retcode"}!=0 ;
+		  
+		  $core_part .= sprintf("%s-%s,%4.1f' %30s %2d %s - return %d\n"
+			, strftime("%T", localtime($l->{"begin_time"}))
+			, strftime("%T", localtime($l->{"end_time"}))
+			, ($l->{"end_time"} - $l->{"begin_time"})/60.0
+			, basename($l->{"job"})
+			, $l->{"end_rank"}
+			, $l->{"flags"}
+			, $l->{"retcode"}
+			) ;
+			push(@attachments,{"job"=>$l->{"job"} , "output" => $l->{"output"}}) ;
+			#$this->{"attachment"}{$l->{"begin_time"}} = {"job"=>$l->{"job"} , "output" => $l->{"output"}} ;
+			$log->info(1,"job: ",basename($l->{"job"}),"\n") ;
+			$log->info(2,$l->{"output"}) ;
+		}	
+
+		$core_part .= sprintf("\nend: %s\nduration: %.1f'\n"
+			, strftime("%F %T",localtime())
+			, (time()-$this->{"start_time"})/60.
+			) ;
+		$this->{"core_part"} = $core_part ;
+		$this->{"attachments"} = \@attachments ;
+	}
+
+	#--------------------
+	sub send
+	{
+		my($this,%h) = @_ ;
+
+		%h = map { /^-/ ? lc(substr($_,1)) : $_ ; } %h ;
+
+		  #my $mail_domain = $config->{"conf"}{"mail_domain"} ;
+		  my $mail_from = $h{"mail_from"} ;
+		  my $mail_to = $h{"mail_to"} ;
+		  my $top = MIME::Entity->build(Type    =>"multipart/mixed",
+		                           From    => $mail_from,
+		                           To      => $mail_to,
+		                           Subject => sprintf("[cronlog] %s #%s %s %s",$h{"dir"}
+									,scalar(@{$this->{"attachments"}}),$h{"from_host"},'*'x$this->{"nberr"})) ;
+
+		   for my $i (@{$this->{"attachments"}})
+		  #for my $k (sort keys %{$this->{"attachment"}})
+		  {
+		    #my $i = $this->{"attachment"}{$k} ;
+		    my $f = basename($i->{"job"}) ;
+		    my $log = "*** $f ***\n\n".$i->{"output"} ;
+			if ($h{"multiparted_mail"}==1)
+			{
+				$log = "*** $f ***\n\n".$i->{"output"} ;
+			    $top->attach(Data=>$log
+					, Type => "text/plain"
+					, Filename=>"$f.log");
+			}
+			else
+			{
+				$log = "\n*** $f ***\n".$i->{"output"} ;
+				$this->{"core_part"} .= "$log\n" ;
+			}
+		  }
+
+		  my $core ;
+		  $core = MIME::Entity->build(Type    =>"text/plain",
+		                           Data => $this->{"core_part"});
+		  $top->add_part($core,0) ;
+
+		  my $smtp_server = $h{"smtp_server"} ;
+		  my $smtp = Net::SMTP->new($smtp_server) or die "can't connect to tyhe SMTP server '$smtp_server'" ;
+		  $smtp->mail($ENV{"USER"});
+		  $smtp->to($mail_to);
+		  #$smtp->to("root");
+		  
+		  $smtp->data();
+		  $smtp->datasend($top->as_string());
+		  $smtp->dataend();
+		  $smtp->quit;
+		}
+
+}
+
+
+
+############################################################
+############################################################
+
+#--------------------
+=comment
+Syntaxe :
+	host
+	host(opt1=val1,opt2=val2)
+	@group
+	@group(opt1=val1,opt2=val2)
+	!command
+	(global_opt1=val1,global_opt2=val2)
+=cut
+
+ 
+#--------------------
+
+my ($config_file, $host_target) ;
+
+my $verbose = 0 ;
+my $debug = 0 ;
+my $dry_run = 0 ;
+my $foreground = 0 ;
+my $no_sleep = 0 ;
+my $no_mail = 0 ;
+
+GetOptions(
+	"d+" => \$debug
+	, "c=s" => \$config_file
+	, "n|dry-run" => \$dry_run
+	, "v+" => \$verbose
+	, "foreground" => \$foreground
+	, "no-sleep" => \$no_sleep
+	, "no-mail" => \$no_mail
+	, "h=s" => \$host_target
+	, "help" => \&help
+	, "man" => \&man
+) or help() ;
+
+#$dry_run = 1 if $host_target ;
+#$verbose = 1 if $dry_run || !$debug ;
+#$foreground = 1 if $debug || $dry_run ;
+
+openlog($this_prog,'cons,pid',$FACILITY);
+
+$log = new Log(
+	-start_time => time()
+	, -verbose_level => $verbose
+ 	, -debug_level => $debug
+	) ;
+
+my(@attachments,$core_part,$ldir,$fc,$ok,$found,$me,$dir,$f,$t) ;
+
+$dir=shift() or help() ;
+$dir =~ s|/$|| ;
+$ldir = $dir ;
+($ldir) = $dir=~/\/([^\/]+)$/ if $ldir=~m|/| ;
+
+
+	#my ($conf,$groups) = getconf() ;
+	my $config ;
+
+	if ($config_file)
+	{
+		$config = new Config(-file=>$config_file,-path=>"") ;
+	}
+	else
+	{
+		$config = new Config(
+			-file=>"$this_prog.conf"
+			, -path=>$FindBin::Bin.":$CONFPATH"
+		) ;
+	}
+	$config->load() ;
+	# die Dumper $config ;
+	#$rt->{"config"} = $config ;
+
+my $this_host ;
+if ($host_target)
+{
+  $this_host = $host_target ;
+}
+else
+{
+  $this_host = hostname() ;	# get target name
+  $this_host =~ s/\..*$// ;	
+}
+
+#my $nbj = 0 ;
+my $task ;
+
+my $tasks = new Tasks ;
+$tasks->init(
+	-dir => $dir
+	, -this_host => $this_host
+	, -groups => $config->{"groups"}
+	, -enhanced_mode => $config->{"conf"}{"enhanced_mode"}
+	, -job_name => $config->{"conf"}{"job_name"}
+	) ;
+
+$tasks->run(
+	-verbose => $verbose
+	, -debug => $debug
+	, -foreground => $foreground
+	, -dry_run => $dry_run
+	, -no_sleep => $no_sleep
+	, -shell_fmt => $config->{"conf"}{"shell_fmt"}
+	) unless $dry_run==1 ;
+#die Dumper $tasks ;  
+
+unless($no_mail)
+{
+	my $l = $tasks->get_log() ;
+
+	$log->summary($l) ;
+
+	$log->send(
+		-from_host => $this_host
+		, -mail_from => "$this_host $this_prog <root\@".hostname().">"
+		, -mail_to => $config->{"conf"}{"mail_to"}
+		, -smtp_server => $config->{"conf"}{"smtp_server"}
+		, -dir => $ldir
+		, -multiparted_mail => $config->{"conf"}{"multiparted_mail"}
+		) ;
+}
+
+closelog();
+exit 0 ;  
+
+__END__
+
+=head1 NAME 
+
+runcronjobs - centralized cron jobs processor
+
+=head1 SYNOPSIS 
+
+runcronjobs options directory
+
+=head1 DESCRIPTION 
+
+C<runcronjobs> processes the execution of centralized cron jobs for a pool of servers.
+
+The cron jobs are any executable files (scripts and binaries).
+C<runcronjobs> runs cronjobs located in a given directory
+if the current host is specified as a target host for this jobs (see directives bellow).
+This allows to centralize all the cron jobs of a set of servers in a common shared directory.
+
+=head1 FEATURES
+
+=over  
+
+=item - notification by mail on each invocation
+
+The mail report begins with a global summary for all the jobs : timestamp of the begin of execution,
+timestamp of the end, elapsed time, return code, following by the output of each of them
+(and optionnal additionnal informations).
+
+=item - capabilities of parallelization for jobs executions
+
+=item - optionnal delay before execution
+
+=back
+
+=head1 COMMAND LINE ARGUMENTS
+
+The command line arguments are :
+
+=over 
+
+=item 
+B<-v --verbose> : verbose level
+
+=item 
+B<-d --debug> : debug level
+
+=item 
+B<-n --dry-run> : dry run, don't execute jobs
+
+=item 
+B<-f --foreground> : jobs are no threaded
+
+=item 
+B<--no-sleep> : sleep directives are ignored
+
+=item
+B<--no-mail> : don't send mail 
+
+=item 
+B<-h> I<hostname> : simule execution from this host
+
+=item 
+B<-c> I<config_file> : use an alternate configuration file 
+(default is C<runcronjobs.conf> located in the executable 
+directory or, if not found, in /etc)
+
+=back
+
+=head1 JOB DIRECTIVES
+
+Somme directives can be insered anywhere into the jobs. They allow to control the behaviour of C<runcronjobs>.
+
+A directive is a line containing the string B<_runcronjobs_>.
+The begin of the line (before B<_runcronjobs_>) is ignored, and the rest (after B<_runcronjobs_>) is parsed.
+So, the directive can be located for example in a comment or a string constant, depending of the language using by the job.
+A # in a directive begins a comment.
+
+For exemple,
+
+	# _runcronjobs_ server1 server2(detach=1) @group1 # my comment
+	
+
+can be a directive line in a shell or perl job.
+	
+The syntax of the directive is one or more specifications following the B<_runcronjobs_> tag,
+each specification delimited by white spaces :
+	
+	_runcronjobs_ spec1 spec2 spec3...
+
+=head2 Specifications
+
+Specifications are :
+
+=over 8
+
+=item B<hostname> : 
+
+adds a target host for this jobs.
+
+=item B<hostname(arg1=val1,arg2=val2,...)> : 
+
+adds a target host for this jobs, and specifies some valued arguments for this host
+
+=item B<@group> :
+
+adds a group of target hosts for this jobs. This group must be defined in the configuration file
+
+=item B<@group(arg1=val1,arg2=val2,...)> :
+
+adds a group of target hosts for this jobs, and specifies some valued arguments for 
+every host member of this group
+
+=item B<(arg1=val1,arg2=val2,...)> :
+
+specifies valued arguments for any target hosts 
+
+=back
+
+=head2 Valued arguments
+
+Possible valued arguments are :
+
+=over
+
+=item B<detach>=0/1 (default is 0)
+
+activate/desactivate an independant thread for this job
+
+=item B<sleep>=n
+
+run jobs after a sleep period on n minutes (useful for threaded jobs)
+
+=item B<output>=0/1 (default is 1)
+
+activate/desactivate the output reporting
+
+=item B<verbose>=0/1 (default is 0)
+
+activate additionnal messages in the output reporting
+
+=back
+
+=head2 Examples
+
+Below are examples of shell scripts as cron jobs :
+
+	#!/bin/sh
+	
+	# _runcronjobs_ server1 server2 
+	
+	/usr/bin/find /tmp -mtime +10 -exec rm {} \;
+	exit $?
+
+The previous job will be run by hosts server1 and server2
+
+	#!/bin/sh
+	
+	# _runcronjobs_ server1 server2(detach=1,sleep=10) 
+	# _runcronjobs_ (output=1)	# global options
+	
+	/usr/bin/find /tmp -mtime +10 -exec rm {} \;
+	exit $?
+
+The previous job will be run by hosts server1 and server2. Two arguments are set for server2,
+so this job will be detach from the sequential stream, and a pause of 10mn will be assumed
+before execution beginning.
+
+	#!/bin/sh
+	
+	# _runcronjobs_ @group
+	
+	/usr/bin/find /tmp -mtime +10 -exec rm {} \;
+	exit $?
+
+The previous job will be run by every hosts members of the group group. groups1 must be defined 
+in the configuration file.
+
+	#!/bin/sh
+	
+	# _runcronjobs_ server @group
+	# _runcronjobs_ (output=1)	# global options
+	
+	/usr/bin/find /tmp -mtime +10 -exec rm {} \;
+	exit $?
+
+The previous job will be run by every hosts members of the group group, and by server. 
+Argument output is set for every hosts.
+
+	#!/bin/sh
+	
+	# _runcronjobs_ server1 server2(detach=1,sleep=10) 
+	# _runcronjobs_ server3 @group1
+	# _runcronjobs_ (output=1)	# global options
+	
+	/usr/bin/find /tmp -mtime +10 -exec rm {} \;
+	exit $?
+
+=head1 CONFIGURATION FILE
+
+The default configuration file is C<runcronjob.conf>, located in the same directory as the binary,
+or in C</etc> and C</etc/runcronjobs.d> otherwise. It can be redefined with the B<-c> option. 
+
+=head2 Variables definition
+
+Some variable can be defined with the syntax :
+
+	variable=value
+
+See C<runcronjobs.conf-sample> file for more explanations.
+
+=head2 Host groups definition
+
+Host groups are defined in a section C<< <host_groups></host_groups> >> in which each group is defined with a line like :
+
+	group=member1,member2,member3
+
+A group can be a member of a group, and in this case, must be prepended with @ :
+
+	group1=member1,@group2
+
+=head2 Example
+
+	<host_groups>
+		all=@interactives,@monitoring,@mail
+		mail=mx1,mx2
+		monitoring=nagios,perfs
+		interactives=users1,users2,users3
+	</host_groups>
+
+=head1 OUTPUT
+
+C<runcronjobs> send a mail on each run. 
+This mail begins with a summary of the launched jobs, one line per job,
+sorted by beginning timestamp.
+The fC<>ormat of this line is :
+
+	begin_timestamp
+	 -
+	  end_timestamp 
+	   jobname 
+	    rank_of_end_timestamp flags 
+	     - 
+	      return 
+	       retcode
+
+Flags are :
+
+=over 4
+
+=item B<&> : 
+job execution has been detached (C<detach> directive)
+ 
+=item B<z> : 
+job has slept (C<sleep> directive)
+
+=back
+
+The fC<>ormat of the subject of the mail is :
+
+	directory name
+	 # of jobs run
+	  hostname
+	   ***
+
+where the number of stars is the number of jobs which has returned a non zero return code.
+
+=head1 HOW TO USE RUNCRONJOBS
+
+To centralize the control of the cron jobs for several servers,
+create a shared directory (C</shared/cron.d>, for example), and 
+subdirs like hourly, daily, weekly, monthly, and  
+put your cron jobs on them.
+Add one or more directives in each cron job to specify at least the host targets (optionnally with arguments), like :
+
+	# _runcronjobs_ server1 server2(detach=1) server3
+
+Then add in the crontab of each server something like :
+	
+	52 * * * * root /shared/runcronjobs /shared/cron.d/hourly
+	31 3 * * * root /shared/runcronjobs /shared/cron.d/daily
+	21 2 * * 1 root /shared/runcronjobs /shared/cron.d/weekly
+	11 1 1 * * root /shared/runcronjobs /shared/cron.d/monthly
+	
+After that, each server will run its own jobs.
+=pod
+
+=head1 SEE ALSO
+
+C<MIME::Entity>, C<Config::General>, C<Dir::Which>, C<Set::Groups>
+
+=head1 AUTHOR
+
+Jacquelin Charbonnel, C<< <http://math.univ-angers.fr/~charbonnel> >>
+
+=head1 BUGS
+
+Please report any bugs or feature requests to
+C<< <jacquelin.charbonnel at math.cnrs.fr> >>
+
+=head1 SUPPORT
+
+Last version can be found on C<< <http://math.univ-angers.fr/runcronjobs> >>
+
+You can find documentation for this module with the perldoc command :
+
+    perldoc runcronjobs
+
+=head1 COPYRIGHT & LICENSE
+
+Copyright Jacquelin Charbonnel E<lt> jacquelin.charbonnel at math.cnrs.fr E<gt>
+
+This software is governed by the CeCILL-C license under French law and
+abiding by the rules of distribution of free software.  You can  use, 
+modify and/ or redistribute the software under the terms of the CeCILL-C
+license as circulated by CEA, CNRS and INRIA at the following URL
+"http://www.cecill.info". 
+
+As a counterpart to the access to the source code and  rights to copy,
+modify and redistribute granted by the license, users are provided only
+with a limited warranty  and the software's author,  the holder of the
+economic rights,  and the successive licensors  have only  limited
+liability. 
+
+In this respect, the user's attention is drawn to the risks associated
+with loading,  using,  modifying and/or developing or reproducing the
+software by the user in light of its specific status of free software,
+that may mean  that it is complicated to manipulate,  and  that  also
+therefore means  that it is reserved for developers  and  experienced
+professionals having in-depth computer knowledge. Users are therefore
+encouraged to load and test the software's suitability as regards their
+requirements in conditions enabling the security of their systems and/or 
+data to be ensured and,  more generally, to use and operate it in the 
+same conditions as regards security. 
+
+The fact that you are presently reading this means that you have had
+knowledge of the CeCILL-C license and that you accept its terms.
+
