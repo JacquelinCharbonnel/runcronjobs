@@ -40,9 +40,9 @@ use Set::Groups ;
 
 use strict ;
 
-my $VERSION = "1.0" ;
-my $REV = '$LastChangedRevision: 12 $' ; $REV =~ s/[^\d\.]//g ; # version management for subversion
-my $VERSION = "1.0.0" ; # version management for git
+#my $VERSION = "1.0" ;
+#my $REV = '$LastChangedRevision: 12 $' ; $REV =~ s/[^\d\.]//g ; # version management for subversion
+my $VERSION = "1.0.1" ; # version management for git
 
 my $this_prog = basename($0) ;
 my($DATE,$HOSTNAME,$SENDMAIL,$EMAIL) ;
@@ -67,7 +67,7 @@ my $default_conf = {
 sub help
 {
   printf(<<"EOL") ;
-$this_prog $VERSION (rev $REV)
+$this_prog $VERSION 
 
 Usage: $this_prog options directory
        $this_prog [--help|--man]
@@ -672,6 +672,7 @@ sub man
 		  #$smtp->to("root");
 		  
 		  $smtp->data();
+		  $smtp->datasend("Date: " . strftime("%a, %d %b %Y %H:%M:%S %z", localtime) . "\n"); ##
 		  $smtp->datasend($top->as_string());
 		  $smtp->dataend();
 		  $smtp->quit;

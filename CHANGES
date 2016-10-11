@@ -3,3 +3,5 @@
 0.2	
 	add several new options in runcronjobs.conf
 	add a --man option in the command line
+
+1.0.1	add a timestamp into the mails sent
